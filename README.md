@@ -1,14 +1,89 @@
-代码：
-本代码仓基于yolov8增加分块特征融合卷积BFFConv、多维卷积反池化注意力模块MCDA、辅助训练头AuxHead
-模块代码分别存储于：
-1.分块特征融合卷积BFFConv位于bmayolo-main\ultralytics\nn\extra_modules\block.py下的class EMSConv
-2.多维卷积反池化注意力模块MCDA位于bmayolo-main\ultralytics\nn\extra_modules\attention.py下的class MCDA
-3.辅助训练头Auxhead位于bmayolo-main\ultralytics\nn\extra_modules\head.py下的class DetectAux
-4.yaml文件存储于bmayolo-main\ultralytics\cfg\models
-训练时将train.py中model更改为ultralytics/cfg/models/BMA-YOLO.yaml
+# 1. 代码依赖关系和需求
 
-数据集：
-本实验所使用的数据集为开源数据集，均按照训练集、验证集、测试集7：2：1进行划分
-可从百度网盘链接中获取：https://pan.baidu.com/s/1ZHoPjYaQRxxjnrvuoCxlOA?pwd=duue 提取码: duue 
+## 1.1 实验平台及环境
 
-如有疑问或需要（如：实验结果权重等）可与我联系：邮箱jh77cf77@163.com
+- **CPU**: AMD EPYC 7763C  
+- **GPU**: NVIDIA GeForce RTX 4090  
+- **System**: Ubuntu 20.04.1 LTS  
+- **Python**: 3.8  
+- **Ultralytics**: 8.0.202  
+- **torch**: 1.13.1  
+- **torchvision**: 0.14.1  
+
+**额外需要的包安装命令**:
+pip install timm thop efficientnet_pytorch einops grad-cam dill albumentations -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+
+## 1.2 训练超参数
+
+- **Learning rate**: 1e-2  
+- **Optimizer**: SGD  
+- **Momentum**: 0.937  
+- **Weight decay**: 5e-4  
+- **Close mosaic**: 10  
+- **Amp**: true  
+- **Epochs**: 300  
+- **Batch size**: 8  
+- **Image size**: 640×640  
+
+## 1.3 文件说明
+
+- **模型配置文件存储于**: `bmayolo-main/ultralytics/cfg/models`  
+- **train.py**: 训练模型的脚本  
+- **main_profile.py**: 输出模型和模型每一层的参数, 计算量的脚本  
+- **val.py**: 使用训练好的模型计算指标的脚本  
+- **detect.py**: 推理的脚本  
+- **track.py**: 跟踪推理的脚本  
+- **test_yaml.py**: 用来测试所有yaml是否能正常运行的脚本  
+- **heatmap.py**: 生成热力图的脚本  
+- **get_FPS.py**: 计算模型储存大小、模型推理时间、FPS的脚本  
+- **get_COCO_metrice.py**: 计算COCO指标的脚本  
+- **plot_result.py**: 绘制曲线对比图的脚本  
+
+---
+
+# 2. 关键算法的描述和实现
+
+本代码仓基于基准模型增加分块特征融合卷积BFFConv、多维卷积反池化注意力模块MCDA、辅助训练头AuxHead。
+
+## 2.1 分块特征融合卷积BFFConv
+
+**代码位于**: `bmayolo-main/ultralytics/nn/extra_modules/block.py` 下的 `class EMSConv`  
+
+**描述**: 通过使用BFFConv构建轻量级残差块，分割上层特征图与多尺度卷积生成多层次特征，在特征增强阶段获得更好的信息交互，充分挖掘局部特征信息以提高模型对不同尺寸对象的判断能力。  
+
+**实现**: 训练过程中，输入特征图经历一个策略性的分割过程，其中一半的特征图未经更改，保留原始的信息，维护原始信息的完整，通过提供一个短路路径直接传递信息缓解随着网络深度加深可能出现的性能退化问题。另一半特征图则根据卷积核的个数进一步等分，每一部分通过不同尺寸的卷积核进行处理。多尺度卷积的使用允许网络通过较小的卷积核捕获细节特征，同时通过较大的卷积核拓宽感受野，增强其对远程特征关系的提取能力，以抓取更全局的上下文信息。最终，这些经过多尺度处理的特征信息通过一个1x1的逐点卷积层进行整合。该卷积层起到了跨通道混合和组合特征的作用，有效地融合了来自不同尺度的信息，同时保持了特征图的空间分辨率不变。
+
+## 2.2 多维卷积反池化注意力模块MCDA
+
+**代码位于**: `bmayolo-main/ultralytics/nn/extra_modules/attention.py` 下的 `class MCDA`  
+
+**描述**: MCDA为专注于多通道特征提取和加权的注意力机制模块，其设计核心在于实现空间信息和通道信息的融合，结合对多维卷积层分别进行全局和局部特征提取，实现对整体图像结构信息和局部区域细节特征的同时关注。  
+
+**实现**: 在前向传播过程中，为引入空间信息，该模块采用自适应平均池化对输入特征进行局部区域提取，并通过一维和二维卷积层分别对局部区域特征进行全局和局部特征的提取，以实现模块对整体图像结构信息和局部区域细节特征的同时关注。一维卷积层的卷积核大小根据输入尺寸动态调整，在捕获局部跨通道交互信息时，仅考虑每个通道与其k个相邻通道之间的关系。此外，为了降低参数量和计算量，该模块的二维卷积层采用了1*1的卷积核，通过在通道维度上进行特征组合和压缩。在处理全局和局部特征时，为加速模型的训练和推理过程，采用了比传统Sigmoid函数更高效的Hardsigmoid函数，得模型在反向传播过程中梯度更稳定地传播，有效减少梯度消失或爆炸的可能性，有助于训练更深更复杂的神经网络模型。最后，通过反平均池化操作将加权融合的全局和局部特征还原到原有维度，并将加权后的特征与原始输入逐元素相乘，得到最终特征表示。
+
+## 2.3 辅助训练头Auxhead
+
+**代码位于**: `bmayolo-main/ultralytics/nn/extra_modules/head.py` 下的 `class DetectAux`  
+
+**描述**: 在网络的中间层增加辅助训练头（AuxHead）及辅助损失为指导的浅层网络权重。通过捕捉更丰富的梯度信息帮助训练，提高模型的稳定性和泛化能力，满足更为复杂的实际工业应用需求。  
+
+**实现**: 辅助训练头AuxHead被引入网络的中间层，专门用于提取较低层次的特征，增强模型对输入数据局部特性的理解。此外，辅助训练头引导模型更关注那些难以分类或定位的样本，从而提高模型的整体召回率。考虑到辅助训练头AuxHead位于网络架构的较浅层，特征提取能力弱，我们采用了更宽松的标签分配策略以捕捉更多数据模式。这种策略有助于提升模型对各类目标的检测能力，但在一定程度上会增加模型对噪声的敏感性，故标签分配策略的正样本数量上限的设定需根据数据集特性和实验结果进行优化。
+
+---
+
+# 3. 相关细节
+
+为了充分验证所提出的方法的有效性和泛化性能，本文采用三个流行的公共数据集进行检测。即：采用NEU-DET数据集进行钢材表面缺陷检测，采用DAGM2007数据集进行织物缺陷检测，采用PCB-DET数据集进行PCB缺陷检测。数据集均按照训练集、验证集、测试集7：2：1进行划分，相关数据集可从百度网盘链接中获取：  
+[百度网盘链接](https://pan.baidu.com/s/1ZHoPjYaQRxxjnrvuoCxlOA?pwd=duue)  
+提取码: `duue`  
+
+如有疑问或需要（如：实验结果权重等）可与我联系：  
+📧 邮箱: [jh77cf77@163.com](mailto:jh77cf77@163.com)  
+
+---
+
+# 4. 引文格式
+
+**文章标题**: Block-wise Feature Fusion for High-Precision Industrial Surface Defect Detection  
+**投稿期刊**: The Visual Computer  
